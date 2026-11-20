@@ -58,7 +58,9 @@ app.use((req, res, next) => {
 });
 app.options("*", (req, res) => res.sendStatus(204));
 
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN ? process.env.ALLOWED_ORIGIN.split(",") : true }));
+// Accept requests from any domain (skytraden.com, www., localhost, etc.)
+// Paper-trading API; harden later with API_ACCESS_KEY for production.
+app.use(cors({ origin: true }));
 
 app.use(express.json());
 app.use(express.static(__dirname)); // open http://localhost:3001 as fallback
@@ -83,6 +85,7 @@ let botConfig = {
   stopLossPct: 2,
   takeProfitPct: 4,
   allowShorts: true,
+  strategy: "RSI Mean Reversion",
   timeframe: "15Min",
 };
 if (fs.existsSync(CONFIG_FILE))
@@ -298,6 +301,95 @@ wss.on("connection", (socket, req) => {
   }, 3000);
   socket.on("close", () => clearInterval(interval));
 });
+
+
+// ================= SERVER-SIDE AI BOT — runs 24/7 in the cloud =================
+// Armed by the "Enable AI bot" checkbox (botConfig.enabled) saved from the site.
+function rsi14(cs){const o=[];let g=0,l=0;for(let i=1;i<cs.length;i++){const ch=cs[i].close-cs[i-1].close;
+if(i<=14){g+=Math.max(ch,0);l+=Math.max(-ch,0);if(i===14)o.push({t:cs[i].time,v:100-100/(1+(l===0?100:g/l))});}
+else{g=(g*13+Math.max(ch,0))/14;l=(l*13+Math.max(-ch,0))/14;o.push({t:cs[i].time,v:100-100/(1+(l===0?100:g/l))});}}return o;}
+function emaS(cs,p){const o=[];const k=2/(p+1);let e=null;for(let i=0;i<cs.length;i++){e=cs[i].close*(i?k:1)+(e||cs[i].close)*(i?1-k:0);if(i>=p-1)o.push({t:cs[i].time,v:e});}return o;}
+function macdS(cs){const f=emaS(cs,12),s=emaS(cs,26);return f.map((x,i)=>({t:x.t,v:x.v-(s[i]?s[i].v:0)})).slice(14);}
+function atrS(cs,p=14){const o=[];let a=null;for(let i=1;i<cs.length;i++){const tr=Math.max(cs[i].high-cs[i].low,Math.abs(cs[i].high-cs[i-1].close),Math.abs(cs[i].low-cs[i-1].close));
+a=a==null?tr:(a*(p-1)+tr)/p;if(i>=p)o.push({t:cs[i].time,v:a});}return o;}
+
+const SBOT_STRATS = {
+  "RSI Mean Reversion": cs=>{const r=rsi14(cs);if(r.length<2)return null;const v=r[r.length-1].v;
+    if(v<30)return{side:"buy",reason:"RSI "+v.toFixed(1)+" oversold"};if(v>70)return{side:"sell",reason:"RSI "+v.toFixed(1)+" overbought"};return null;},
+  "EMA Cross (9/21)": cs=>{const f=emaS(cs,9),s=emaS(cs,21);if(f.length<2||s.length<2)return null;
+    const off=f.length-s.length,i=f.length-1,cur=f[i].v-s[i-off].v,prev=f[i-1].v-s[i-off-1]?.v;
+    if(prev==null)return null;
+    if(prev<=0&&cur>0)return{side:"buy",reason:"EMA9 crossed above EMA21"};
+    if(prev>=0&&cur<0)return{side:"sell",reason:"EMA9 crossed below EMA21"};return null;},
+  "MACD Crossover": cs=>{const m=macdS(cs);if(m.length<2)return null;const i=m.length-1;
+    if(m[i].v>0&&m[i-1].v<=0)return{side:"buy",reason:"MACD crossed above zero"};
+    if(m[i].v<0&&m[i-1].v>=0)return{side:"sell",reason:"MACD crossed below zero"};return null;},
+  "Donchian Breakout (20)": cs=>{if(cs.length<21)return null;const last=cs[cs.length-1];
+    const hh=Math.max(...cs.slice(-21,-1).map(c=>c.high)),ll=Math.min(...cs.slice(-21,-1).map(c=>c.low));
+    if(last.close>hh)return{side:"buy",reason:"broke 20-bar high"};
+    if(last.close<ll)return{side:"sell",reason:"broke 20-bar low"};return null;},
+  "Momentum (RSI>55 + EMA20)": cs=>{const r=rsi14(cs),e=emaS(cs,20);if(!r.length||!e.length)return null;const last=cs[cs.length-1];
+    if(r[r.length-1].v>55&&last.close>e[e.length-1].v)return{side:"buy",reason:"momentum aligned"};
+    if(r[r.length-1].v<45&&last.close<e[e.length-1].v)return{side:"sell",reason:"downside momentum"};return null;},
+};
+
+async function fetchCandles(symbol, tf) {
+  try {
+    const d = await alpacaFetch(`/v2/stocks/${symbol}/bars?timeframe=${tf}&limit=120&feed=iex`);
+    let bars = d.bars; if (!Array.isArray(bars)) bars = (bars && bars[symbol]) || [];
+    if (bars.length) return bars.map(b => ({ t: Math.floor(new Date(b.t).getTime()/1000), o:b.o,h:b.h,l:b.l,c:b.c }));
+  } catch {}
+  // Yahoo fallback
+  const map = {"15Min":["15m","1mo"],"5Min":["5m","1mo"],"60Min":["60m","3mo"],"1Day":["1d","1y"]};
+  const [iv,rg] = map[tf] || map["15Min"];
+  const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${iv}&range=${rg}`,{headers:{"User-Agent":"Mozilla/5.0"}});
+  const j = await res.json(); const r = j?.chart?.result?.[0]; if(!r) return [];
+  const q = r.indicators?.quote?.[0] || {}; const out = [];
+  for (let i=0;i<(r.timestamp||[]).length;i++){ if(q.open?.[i]==null)continue;
+    out.push({t:r.timestamp[i],o:q.open[i],h:q.high[i],l:q.low[i],c:q.close[i]});}
+  return out;
+}
+const sbotLog = m => { console.log("[BOT]", new Date().toISOString().slice(11,19), m); botTrades.push({event:"log",msg:m,serverTime:new Date().toISOString()}); };
+
+setInterval(async () => {
+  try {
+    if (!botConfig.enabled) return;
+    const strat = SBOT_STRATS[botConfig.strategy] || SBOT_STRATS["RSI Mean Reversion"];
+    // 1) manage exits on open positions (SL/TP from config)
+    let positions = [];
+    try { positions = await alpacaFetch("/v2/positions"); } catch {}
+    for (const p of positions) {
+      const entry = parseFloat(p.avg_entry_price), cur = parseFloat(p.current_price);
+      const qty = Math.abs(parseFloat(p.qty)); const long = parseFloat(p.qty) > 0;
+      const pnlPct = (cur - entry) / entry * 100 * (long ? 1 : -1);
+      if (pnlPct <= -botConfig.stopLossPct || pnlPct >= botConfig.takeProfitPct) {
+        await alpacaFetch("/v2/orders", { method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({ symbol:p.symbol, qty, side: long?"sell":"buy", type:"market", time_in_force:"day" }) });
+        sbotLog(`EXIT ${p.symbol} @ ${cur} (${pnlPct.toFixed(2)}%)`);
+      }
+    }
+    if (positions.length >= botConfig.maxOpenPositions) return;
+    // 2) scan for entries
+    for (const sym of (botConfig.symbols || []).slice(0, 20)) {
+      if (positions.some(p => p.symbol === sym)) continue;
+      const cs = await fetchCandles(sym, "15Min");
+      if (cs.length < 30) continue;
+      const sig = strat(cs);
+      if (!sig) continue;
+      const price = cs[cs.length-1].c;
+      const acc = await alpacaFetch("/v2/account");
+      const equity = parseFloat(acc.equity);
+      const dollars = botConfig.allocationType === "percent" ? equity * botConfig.allocationValue / 100 : botConfig.allocationValue;
+      const qty = Math.max(1, Math.floor(dollars / price));
+      await alpacaFetch("/v2/orders", { method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ symbol:sym, qty, side:sig.side, type:"market", time_in_force:"day" }) });
+      sbotLog(`ENTRY ${sig.side.toUpperCase()} ${qty} ${sym} @ ~${price.toFixed(2)} — ${sig.reason} [${botConfig.strategy}]`);
+      botTrades.push({event:"entry",symbol:sym,side:sig.side,qty,price,reason:sig.reason,strategy:botConfig.strategy,serverTime:new Date().toISOString()});
+      fs.writeFileSync(BTRADES_FILE, JSON.stringify(botTrades, null, 1));
+      break; // one entry per cycle
+    }
+  } catch (e) { console.log("[BOT] cycle error:", e.message); }
+}, 60000); // every 60 seconds, 24/7, even with every browser closed
 
 server.listen(PORT, () => {
   console.log(`Skytraden API running on port ${PORT} | Mode: ${process.env.ALPACA_ENV || "paper"}`);
