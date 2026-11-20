@@ -56,7 +56,6 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Private-Network", "true");
   next();
 });
-app.options("*", (req, res) => res.sendStatus(204));
 
 // Accept requests from any domain (skytraden.com, www., localhost, etc.)
 // Paper-trading API; harden later with API_ACCESS_KEY for production.
