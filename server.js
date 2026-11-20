@@ -159,6 +159,40 @@ app.post("/api/bot/trades", (req, res) => {
   res.json({ ok: true });
 });
 
+// Yahoo quote for ANY symbol incl. futures (ES=F, NQ=F, CL=F, GC=F...) - cached 8s
+app.get("/api/yquote/:symbol", async (req, res) => {
+  try {
+    const s = req.params.symbol;
+    // ?fast=1 -> ~1s cache for the watched contract; default 8s for the rest
+    const ttl = req.query.fast ? 1100 : 8000;
+    const d = await cached("yq:" + s, ttl, async () => {
+      const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(s)}?interval=1m&range=1d`,
+        { headers: { "User-Agent": "Mozilla/5.0 (Skytraden)" } });
+      const j = await r.json();
+      const m = j?.chart?.result?.[0]?.meta;
+      if (!m || m.regularMarketPrice == null) throw new Error("no quote");
+      return { price: m.regularMarketPrice, prev: m.chartPreviousClose || m.previousClose || m.regularMarketPrice, name: m.longName || m.shortName || s };
+    });
+    res.json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Crypto kline history (Binance, public). Browser can't call Binance directly
+// (CORS), so we proxy it. Live ticks go browser <-> Binance WebSocket directly.
+app.get("/api/cklines/:symbol", async (req, res) => {
+  try {
+    const s = req.params.symbol.toUpperCase();
+    const iv = req.query.interval || "15m";
+    const d = await cached("ck:" + s + ":" + iv, 10000, async () => {
+      const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${s}&interval=${iv}&limit=300`);
+      const k = await r.json();
+      if (!Array.isArray(k)) throw new Error("bad klines");
+      return k.map(x => ({ time: Math.floor(x[0] / 1000), open: +x[1], high: +x[2], low: +x[3], close: +x[4], volume: +x[5] }));
+    });
+    res.json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ============ TRADING ROUTES ============
 app.get("/api/health", (req, res) =>
   res.json({ status: "ok", env: process.env.ALPACA_ENV || "paper", time: new Date().toISOString() }));
