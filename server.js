@@ -354,6 +354,7 @@ setInterval(async () => {
   try {
     if (!botConfig.enabled) return;
     const strat = SBOT_STRATS[botConfig.strategy] || SBOT_STRATS["RSI Mean Reversion"];
+    console.log("[BOT] cycle start — strategy:", botConfig.strategy, "| symbols:", (botConfig.symbols||[]).join(",") || "none");
     // 1) manage exits on open positions (SL/TP from config)
     let positions = [];
     try { positions = await alpacaFetch("/v2/positions"); } catch {}
@@ -367,6 +368,7 @@ setInterval(async () => {
         sbotLog(`EXIT ${p.symbol} @ ${cur} (${pnlPct.toFixed(2)}%)`);
       }
     }
+    console.log("[BOT] open positions:", positions.length, "| scanning", (botConfig.symbols||[]).length, "symbol(s)");
     if (positions.length >= botConfig.maxOpenPositions) return;
     // 2) scan for entries
     for (const sym of (botConfig.symbols || []).slice(0, 20)) {
