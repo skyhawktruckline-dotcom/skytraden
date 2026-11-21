@@ -139,12 +139,13 @@ app.post("/api/login", (req, res) => {
     return res.status(401).json({ error: "Wrong username or password" });
   const token = crypto.randomBytes(24).toString("hex");
   sessions.set(token, u.username);
-  res.json({ token, username: u.username });
+  res.json({ token, username: u.username, pro: ADMIN_USERS.includes(u.username.toLowerCase()) || !!u.pro });
 });
 
 app.get("/api/me", (req, res) => {
   const u = sessions.get(req.headers["x-session"]);
-  res.json({ username: u || null });
+  const uu = users.find(x => x.username === u);
+  res.json({ username: u || null, pro: u ? (ADMIN_USERS.includes(u.toLowerCase()) || !!uu.pro) : false });
 });
 
 // ============ BOT TRADE JOURNAL (server-side history) ============
@@ -265,6 +266,48 @@ app.get("/api/news", async (req, res) => {
     });
     res.json(d);
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== ADMIN PRO FLAG + PROMO CODES =====
+const ADMIN_USERS = (process.env.ADMIN_USERS || "skytraden").split(",").map(s => s.trim().toLowerCase());
+
+const PROMO_FILE = "./promo-codes.json";
+let promos = fs.existsSync(PROMO_FILE) ? JSON.parse(fs.readFileSync(PROMO_FILE, "utf8")) : {};
+
+function adminOk(req) {
+  const k = process.env.ADMIN_KEY;
+  return k && req.headers["x-admin-key"] === k;
+}
+app.post("/api/promo/validate", (req, res) => {
+  const code = String((req.body || {}).code || "").trim().toUpperCase();
+  const p = promos[code];
+  if (!p || !p.active) return res.json({ valid: false });
+  if (p.maxUses && p.uses >= p.maxUses) return res.json({ valid: false, msg: "Code limit reached" });
+  res.json({ valid: true, discount: p.discount, price: +(29 * (1 - p.discount / 100)).toFixed(2) });
+});
+app.post("/api/promo/redeem", (req, res) => {  // called after PayPal capture (or manual use)
+  const code = String((req.body || {}).code || "").trim().toUpperCase();
+  if (promos[code]) { promos[code].uses++; fs.writeFileSync(PROMO_FILE, JSON.stringify(promos, null, 1)); }
+  res.json({ ok: true });
+});
+app.post("/api/promo/create", (req, res) => {
+  if (!adminOk(req)) return res.status(403).json({ error: "Admin key required (set ADMIN_KEY env var on Railway)" });
+  const { code, discount, maxUses } = req.body || {};
+  if (!code || !discount) return res.status(400).json({ error: "code + discount required" });
+  const c = String(code).trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  promos[c] = { discount: Math.min(100, Math.max(1, +discount)), maxUses: +maxUses || 0, uses: 0, active: true, created: new Date().toISOString() };
+  fs.writeFileSync(PROMO_FILE, JSON.stringify(promos, null, 1));
+  res.json({ ok: true, code: c });
+});
+app.get("/api/promo/list", (req, res) => {
+  if (!adminOk(req)) return res.status(403).json({ error: "Admin key required" });
+  res.json(Object.entries(promos).map(([c, p]) => ({ code: c, ...p })));
+});
+app.post("/api/promo/toggle", (req, res) => {
+  if (!adminOk(req)) return res.status(403).json({ error: "Admin key required" });
+  const c = String((req.body || {}).code || "").trim().toUpperCase();
+  if (promos[c]) { promos[c].active = !promos[c].active; fs.writeFileSync(PROMO_FILE, JSON.stringify(promos, null, 1)); }
+  res.json({ ok: true });
 });
 
 // ============ TRADING ROUTES ============
