@@ -307,6 +307,7 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 
 wss.on("connection", (socket, req) => {
   const url = new URL(req.url, "http://localhost");
+  if (url.searchParams.get("tv") === "1") return tvProxy(socket, url);
   const symbols = (url.searchParams.get("symbols") || "AAPL").toUpperCase().split(",");
   console.log("Client subscribed:", symbols.join(", "));
   let i = 0;
@@ -425,6 +426,102 @@ setInterval(async () => {
     }
   } catch (e) { console.log("[BOT] cycle error:", e.message); }
 }, 60000); // every 60 seconds, 24/7, even with every browser closed
+
+
+// =====================================================================
+// TRADOVATE CONNECTOR v1 — one connector serves Tradovate + most futures
+// prop firms (Take Profit Trader, Apex, Topstep..., who run on Tradovate).
+// Railway env vars:
+//   TV_URL      e.g. https://demo.tradovate.com/v1  (your firm gives its URL)
+//   TV_WS_MD    e.g. wss://md.tradovate.com/v1/websocket
+//   TV_WS_API   e.g. wss://api.tradovate.com/v1/websocket
+//   TV_USER / TV_PASS   firm account credentials
+//   TV_APP_ID / TV_APP_VERSION / TV_CID / TV_SEC   from developer app registration
+//   TV_DEVICE_ID  any label, e.g. skytraden-1
+//   TV_FIRM_NAME  optional label, e.g. "Take Profit Trader"
+// =====================================================================
+const TVCFG = {
+  url: process.env.TV_URL || "https://demo.tradovate.com/v1",
+  wsMd: process.env.TV_WS_MD || "wss://md.tradovate.com/v1/websocket",
+  wsApi: process.env.TV_WS_API || "wss://api.tradovate.com/v1/websocket",
+  creds: { name: process.env.TV_USER || "", password: process.env.TV_PASS || "", appId: process.env.TV_APP_ID || "", appVersion: process.env.TV_APP_VERSION || "", deviceId: process.env.TV_DEVICE_ID || "skytraden-1", cid: process.env.TV_CID || "", sec: process.env.TV_SEC || "" },
+};
+const tvSessions = new Map();
+async function tvAuth(sess){
+  const s = tvSessions.get(sess) || {};
+  if (s.token && Date.now() < s.exp - 60000) return s.token;
+  const r = await fetch(TVCFG.url + "/auth/accesstoken/request", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(TVCFG.creds) });
+  const d = await r.json();
+  if (!r.ok || !d.accessToken) throw new Error(d.errorText || d.error || "Tradovate auth failed - check TV_* env vars");
+  s.token = d.accessToken; s.exp = d.expirationTime; s.refresh = d.refreshToken;
+  tvSessions.set(sess, s);
+  return s.token;
+}
+app.get("/api/tv/status", async (req, res) => {
+  try {
+    if (!TVCFG.creds.name) return res.json({ ok: false, configured: false, msg: "Set TV_* env vars on Railway to connect (demo or prop firm account)." });
+    await tvAuth("default");
+    res.json({ ok: true, configured: true, demo: TVCFG.url.includes("demo"), firm: process.env.TV_FIRM_NAME || null });
+  } catch (e) { res.json({ ok: false, configured: true, error: e.message }); }
+});
+
+// Tradovate WS framing: \x00 JSON \xff (multiple frames per message possible)
+const tvEnc = s => "\0" + s + "\xff";
+const tvDec = buf => { const out = []; let cur = ""; for (const ch of buf.toString("utf8")) { if (ch === "\0") cur = ""; else if (ch === "\xff") { if (cur) out.push(JSON.parse(cur)); } else cur += ch; } return out; };
+
+// Real-time tick proxy: browser wss://YOUR-RAILWAY/ws?tv=1&symbols=ES,NQ,CL
+async function tvProxy(socket, url) {
+  const WebSocketClient = require("ws").WebSocket;
+  let tv = null;
+  try {
+    const token = await tvAuth("default");
+    const syms = (url.searchParams.get("symbols") || "ES").toUpperCase().split(",");
+    tv = new WebSocketClient(TVCFG.wsMd);
+    await new Promise((res, rej) => { tv.on("open", res); tv.on("error", rej); });
+    const send = o => tv.send(tvEnc(JSON.stringify(o)));
+    let rid = 1; const ids = {};
+    send({ id: rid++, method: "authorize", params: { token } });
+    syms.forEach(s => { send({ id: rid, method: "symbol/resolve", params: { symbol: s } }); ids[rid++] = s; });
+    const subs = [];
+    tv.on("message", buf => {
+      tvDec(buf).forEach(m => {
+        if (m.s === 200 && ids[m.i]) { subs.push(m.d); }                       // symbol resolved -> contract id(s)
+        if (m.i === 1 && m.s === 200 && subs.length === syms.length) send({ id: rid++, method: "md/subscribeQuote", params: { symbols: subs } });
+        if (m.d && m.d.quotes) m.d.quotes.forEach(q => { if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ tv: 1, symbol: q.contractId, price: q.price, bid: q.bid, ask: q.offer, ts: q.timestamp })); });
+        if (m.d && m.d.dom) socket.send(JSON.stringify({ tv: 1, dom: m.d.dom }));
+      });
+    });
+    socket.on("close", () => { try { tv.close(); } catch {} });
+  } catch (e) { try { socket.send(JSON.stringify({ tv: 1, error: e.message })); } catch {} }
+}
+
+// order entry (v1): REST-style via api socket
+app.post("/api/tv/order", async (req, res) => {
+  try {
+    const { action, contractId, qty } = req.body || {};
+    const WebSocketClient = require("ws").WebSocket;
+    const token = await tvAuth("default");
+    const tv = new WebSocketClient(TVCFG.wsApi);
+    await new Promise((r, j) => { tv.on("open", r); tv.on("error", j); });
+    const send = o => tv.send(tvEnc(JSON.stringify(o)));
+    let rid = 1;
+    const done = new Promise((resolve, reject) => {
+      const to = setTimeout(() => reject(new Error("timeout")), 10000);
+      tv.on("message", buf => tvDec(buf).forEach(m => {
+        if (m.s === 200 && m.d && m.d.length) {   // account list
+          const acct = m.d[0].id;
+          send({ id: rid++, method: "order/placeOrder", params: { accountId: acct, contractId, action, orderQty: qty, orderType: "Market", timeInForce: { duration: "Day" }, isAutomated: true } });
+        }
+        if (m.d && m.d.orderId) { clearTimeout(to); resolve(m.d); }
+        if (m.e) { clearTimeout(to); reject(new Error(m.e)); }
+      }));
+    });
+    send({ id: rid++, method: "authorize", params: { token } });
+    send({ id: rid++, method: "account/list", params: {} });
+    const out = await done;
+    res.json({ ok: true, order: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 server.listen(PORT, () => {
   console.log(`Skytraden API running on port ${PORT} | Mode: ${process.env.ALPACA_ENV || "paper"}`);
