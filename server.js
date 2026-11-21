@@ -184,10 +184,28 @@ app.get("/api/cklines/:symbol", async (req, res) => {
     const s = req.params.symbol.toUpperCase();
     const iv = req.query.interval || "15m";
     const d = await cached("ck:" + s + ":" + iv, 10000, async () => {
-      const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${s}&interval=${iv}&limit=300`);
-      const k = await r.json();
-      if (!Array.isArray(k)) throw new Error("bad klines");
-      return k.map(x => ({ time: Math.floor(x[0] / 1000), open: +x[1], high: +x[2], low: +x[3], close: +x[4], volume: +x[5] }));
+      // Binance geo-blocks some cloud IPs (e.g. US-based hosts). Try the public
+      // data mirror first, then the main API, then Yahoo as last resort.
+      const hosts = ["https://data-api.binance.vision", "https://api.binance.com"];
+      for (const host of hosts) {
+        try {
+          const r = await fetch(`${host}/api/v3/klines?symbol=${s}&interval=${iv}&limit=300`);
+          const k = await r.json();
+          if (Array.isArray(k) && k.length) return k.map(x => ({ time: Math.floor(x[0] / 1000), open: +x[1], high: +x[2], low: +x[3], close: +x[4], volume: +x[5] }));
+        } catch {}
+      }
+      // Yahoo fallback (works for crypto as BTC-USD etc.)
+      const ym = { "1m": ["1m", "1d"], "5m": ["5m", "5d"], "15m": ["15m", "1mo"], "30m": ["30m", "1mo"], "1h": ["60m", "1mo"], "4h": ["60m", "3mo"], "1d": ["1d", "6mo"], "1w": ["1d", "1y"] };
+      const ysym = s.replace("USDT", "-USD");
+      const [yi, yr] = (ym[iv] || ym["15m"]);
+      const r2 = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${ysym}?interval=${yi}&range=${yr}`, { headers: { "User-Agent": "Mozilla/5.0" } });
+      const j2 = await r2.json();
+      const res = j2?.chart?.result?.[0]; if (!res) throw new Error("no klines from any source");
+      const q = res.indicators?.quote?.[0] || {}; const ts = res.timestamp || [];
+      const out = [];
+      for (let i = 0; i < ts.length; i++) { if (q.open?.[i] == null) continue; out.push({ time: ts[i], open: q.open[i], high: q.high[i], low: q.low[i], close: q.close[i], volume: q.volume?.[i] || 0 }); }
+      if (!out.length) throw new Error("no klines from any source");
+      return out;
     });
     res.json(d);
   } catch (e) { res.status(500).json({ error: e.message }); }
