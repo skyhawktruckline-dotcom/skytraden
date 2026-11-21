@@ -193,6 +193,62 @@ app.get("/api/cklines/:symbol", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ===== REAL CRYPTO TRADING (BYOK keys in request headers; Binance + testnet) =====
+// Testnet keys (free, no KYC): https://testnet.binance.vision
+app.post("/api/bn/order", async (req, res) => {
+  try {
+    const key = req.headers["x-bn-key"], sec = req.headers["x-bn-secret"];
+    if (!key || !sec) return res.status(400).json({ error: "Add your exchange API keys in the API Key panel first" });
+    const testnet = req.headers["x-bn-testnet"] === "1";
+    const base = testnet ? "https://testnet.binance.vision" : "https://api.binance.com";
+    const { symbol, side, qty } = req.body || {};
+    const params = new URLSearchParams({ symbol: String(symbol || "").toUpperCase(), side: String(side).toUpperCase() === "BUY" ? "BUY" : "SELL", type: "MARKET", quantity: String(qty), timestamp: String(Date.now()) });
+    params.append("signature", crypto.createHmac("sha256", sec).update(params.toString()).digest("hex"));
+    const r = await fetch(base + "/api/v3/order?" + params.toString(), { method: "POST", headers: { "X-MBX-APIKEY": key } });
+    const d = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: d.msg || "Exchange rejected the order" });
+    res.json({ ok: true, filled: d });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get("/api/bn/account", async (req, res) => {
+  try {
+    const key = req.headers["x-bn-key"], sec = req.headers["x-bn-secret"];
+    if (!key || !sec) return res.status(400).json({ error: "Missing keys" });
+    const testnet = req.headers["x-bn-testnet"] === "1";
+    const base = testnet ? "https://testnet.binance.vision" : "https://api.binance.com";
+    const params = new URLSearchParams({ timestamp: String(Date.now()) });
+    params.append("signature", crypto.createHmac("sha256", sec).update(params.toString()).digest("hex"));
+    const r = await fetch(base + "/api/v3/account?" + params.toString(), { headers: { "X-MBX-APIKEY": key } });
+    const d = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: d.msg || "error" });
+    res.json({ ok: true, balances: (d.balances || []).filter(b => parseFloat(b.free) > 0).slice(0, 12) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== LIVE NEWS (free RSS, no key needed) =====
+app.get("/api/news", async (req, res) => {
+  try {
+    const d = await cached("newsfeed", 600000, async () => {
+      const feeds = [
+        ["https://feeds.finance.yahoo.com/rss/2.0/headline?s=NVDA,AAPL,TSLA,SPY&region=US&lang=en-US", "STOCKS"],
+        ["https://www.coindesk.com/arc/outboundfeeds/rss/", "CRYPTO"],
+        ["https://cointelegraph.com/rss", "CRYPTO"]
+      ];
+      const out = [];
+      for (const [u, cat] of feeds) {
+        try {
+          const r = await fetch(u, { headers: { "User-Agent": "Mozilla/5.0 (Skytraden)" } });
+          const x = await r.text();
+          const grab = (t, tag) => { const m = t.match(new RegExp("<" + tag + ">(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?</" + tag + ">")); return m ? m[1].replace(/<[^>]+>/g, "").trim() : ""; };
+          [...x.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 8).forEach(m => out.push({ title: grab(m[1], "title"), link: grab(m[1], "link"), pub: grab(m[1], "pubDate"), cat }));
+        } catch {}
+      }
+      return out.sort((a, b) => new Date(b.pub) - new Date(a.pub)).slice(0, 25);
+    });
+    res.json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ============ TRADING ROUTES ============
 app.get("/api/health", (req, res) =>
   res.json({ status: "ok", env: process.env.ALPACA_ENV || "paper", time: new Date().toISOString() }));
@@ -429,97 +485,113 @@ setInterval(async () => {
 
 
 // =====================================================================
-// TRADOVATE CONNECTOR v1 — one connector serves Tradovate + most futures
-// prop firms (Take Profit Trader, Apex, Topstep..., who run on Tradovate).
+// TRADOVATE CONNECTOR v2 - corrected endpoints + SockJS-style framing
+// Docs: api.tradovate.com | Auth needs LIVE FUNDED acct + $25/mo API add-on
+// (or a prop firm that enables it). appId/appVersion are FREE-FORM strings.
 // Railway env vars:
-//   TV_URL      e.g. https://demo.tradovate.com/v1  (your firm gives its URL)
-//   TV_WS_MD    e.g. wss://md.tradovate.com/v1/websocket
-//   TV_WS_API   e.g. wss://api.tradovate.com/v1/websocket
-//   TV_USER / TV_PASS   firm account credentials
-//   TV_APP_ID / TV_APP_VERSION / TV_CID / TV_SEC   from developer app registration
-//   TV_DEVICE_ID  any label, e.g. skytraden-1
-//   TV_FIRM_NAME  optional label, e.g. "Take Profit Trader"
+//   TV_URL      default https://demo.tradovateapi.com/v1  (live: https://live.tradovateapi.com/v1)
+//   TV_WS_MD    default wss://md.tradovateapi.com/v1/websocket
+//   TV_WS_API   default wss://demo.tradovateapi.com/v1/websocket
+//   TV_USER / TV_PASS          account login (or dedicated API password if set)
+//   TV_APP_ID / TV_APP_VERSION free-form labels, e.g. SkyTraden / 1.0
+//   TV_CID (number) / TV_SEC   from Application Settings > API Access
+//   TV_DEVICE_ID  any unique label, e.g. skytraden-1
 // =====================================================================
 const TVCFG = {
-  url: process.env.TV_URL || "https://demo.tradovate.com/v1",
-  wsMd: process.env.TV_WS_MD || "wss://md.tradovate.com/v1/websocket",
-  wsApi: process.env.TV_WS_API || "wss://api.tradovate.com/v1/websocket",
-  creds: { name: process.env.TV_USER || "", password: process.env.TV_PASS || "", appId: process.env.TV_APP_ID || "", appVersion: process.env.TV_APP_VERSION || "", deviceId: process.env.TV_DEVICE_ID || "skytraden-1", cid: process.env.TV_CID || "", sec: process.env.TV_SEC || "" },
+  url: process.env.TV_URL || "https://demo.tradovateapi.com/v1",
+  wsMd: process.env.TV_WS_MD || "wss://md.tradovateapi.com/v1/websocket",
+  wsApi: process.env.TV_WS_API || "wss://demo.tradovateapi.com/v1/websocket",
+  creds: { name: process.env.TV_USER || "", password: process.env.TV_PASS || "", appId: process.env.TV_APP_ID || "SkyTraden", appVersion: process.env.TV_APP_VERSION || "1.0", deviceId: process.env.TV_DEVICE_ID || "skytraden-1", cid: parseInt(process.env.TV_CID || "0", 10) || 0, sec: process.env.TV_SEC || "" },
 };
 const tvSessions = new Map();
 async function tvAuth(sess){
   const s = tvSessions.get(sess) || {};
-  if (s.token && Date.now() < s.exp - 60000) return s.token;
-  const r = await fetch(TVCFG.url + "/auth/accesstoken/request", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(TVCFG.creds) });
+  if (s.token && Date.now() < new Date(s.exp).getTime() - 60000) return s.token;
+  if (!TVCFG.creds.name || !TVCFG.creds.cid) throw new Error("Tradovate not configured - set TV_* env vars (needs live funded acct or prop firm with API + $25/mo add-on)");
+  const r = await fetch(TVCFG.url + "/auth/accesstokenrequest", { method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" }, body: JSON.stringify(TVCFG.creds) });
   const d = await r.json();
-  if (!r.ok || !d.accessToken) throw new Error(d.errorText || d.error || "Tradovate auth failed - check TV_* env vars");
-  s.token = d.accessToken; s.exp = d.expirationTime; s.refresh = d.refreshToken;
+  if (!r.ok || !d.accessToken) throw new Error(d.errorText || d.error || "Tradovate auth failed");
+  s.token = d.accessToken; s.mdToken = d.mdAccessToken; s.exp = d.expirationTime;
   tvSessions.set(sess, s);
   return s.token;
 }
 app.get("/api/tv/status", async (req, res) => {
   try {
-    if (!TVCFG.creds.name) return res.json({ ok: false, configured: false, msg: "Set TV_* env vars on Railway to connect (demo or prop firm account)." });
+    if (!TVCFG.creds.name) return res.json({ ok: false, configured: false, msg: "Set TV_* env vars on Railway. Note: demo accounts cannot generate API keys - need live funded acct + API add-on, or a prop firm account with API enabled." });
     await tvAuth("default");
     res.json({ ok: true, configured: true, demo: TVCFG.url.includes("demo"), firm: process.env.TV_FIRM_NAME || null });
   } catch (e) { res.json({ ok: false, configured: true, error: e.message }); }
 });
 
-// Tradovate WS framing: \x00 JSON \xff (multiple frames per message possible)
-const tvEnc = s => "\0" + s + "\xff";
-const tvDec = buf => { const out = []; let cur = ""; for (const ch of buf.toString("utf8")) { if (ch === "\0") cur = ""; else if (ch === "\xff") { if (cur) out.push(JSON.parse(cur)); } else cur += ch; } return out; };
+// ---- Tradovate WebSocket protocol (SockJS-inherited framing) ----
+// Server sends: 'o' (open), 'h' (heartbeat every ~2.5s - reply '[]'), 'a[...]' (JSON array of messages), 'c[...]' (close)
+// Client sends requests as JSON array: [endpoint, requestId, params]
+function tvParseFrames(raw){
+  const out = []; let T = "", payload = "";
+  for (const msg of Array.isArray(raw) ? raw : [raw]){
+    const s = msg.toString();
+    T = s.slice(0, 1); payload = s.slice(1);
+    if (T === "a" && payload) { try { JSON.parse(payload).forEach(m => out.push(m)); } catch {} }
+    else if (T === "h" || T === "o") out.push({ _frame: T });
+    else if (T === "c") out.push({ _frame: "c", reason: payload });
+  }
+  return out;
+}
 
-// Real-time tick proxy: browser wss://YOUR-RAILWAY/ws?tv=1&symbols=ES,NQ,CL
-async function tvProxy(socket, url) {
-  const WebSocketClient = require("ws").WebSocket;
+async function tvProxy(socket, url){
   let tv = null;
   try {
-    const token = await tvAuth("default");
+    const sess = await tvAuth("default").catch(() => null);
+    const s = tvSessions.get("default");
     const syms = (url.searchParams.get("symbols") || "ES").toUpperCase().split(",");
+    const WebSocketClient = require("ws").WebSocket;
     tv = new WebSocketClient(TVCFG.wsMd);
     await new Promise((res, rej) => { tv.on("open", res); tv.on("error", rej); });
-    const send = o => tv.send(tvEnc(JSON.stringify(o)));
-    let rid = 1; const ids = {};
-    send({ id: rid++, method: "authorize", params: { token } });
-    syms.forEach(s => { send({ id: rid, method: "symbol/resolve", params: { symbol: s } }); ids[rid++] = s; });
-    const subs = [];
-    tv.on("message", buf => {
-      tvDec(buf).forEach(m => {
-        if (m.s === 200 && ids[m.i]) { subs.push(m.d); }                       // symbol resolved -> contract id(s)
-        if (m.i === 1 && m.s === 200 && subs.length === syms.length) send({ id: rid++, method: "md/subscribeQuote", params: { symbols: subs } });
-        if (m.d && m.d.quotes) m.d.quotes.forEach(q => { if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ tv: 1, symbol: q.contractId, price: q.price, bid: q.bid, ask: q.offer, ts: q.timestamp })); });
-        if (m.d && m.d.dom) socket.send(JSON.stringify({ tv: 1, dom: m.d.dom }));
+    let rid = 1;
+    const send = (endpoint, params) => tv.send(JSON.stringify([endpoint, rid++, params]));
+    const contractIds = {};
+    tv.on("message", raw => {
+      tvParseFrames(raw).forEach(m => {
+        if (m._frame === "h") { tv.send("[]"); return; }            // heartbeat reply
+        if (m._frame) return;
+        if (m.s === 200 && m.d && m.i && m.d.id) {                    // symbol/resolve response
+          contractIds[m.i] = m.d.id;
+          send("md/subscribeQuote", { symbols: Object.values(contractIds) });
+        }
+        if (m.d && m.d.quotes) m.d.quotes.forEach(q => { if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ tv: 1, contractId: q.contractId, price: q.price, bid: q.bid, ask: q.offer, ts: q.timestamp })); });
       });
     });
+    send("authorize", { token: s.mdToken || s.token });
+    syms.forEach(sym => send("symbol/resolve", { symbol: sym }));
     socket.on("close", () => { try { tv.close(); } catch {} });
   } catch (e) { try { socket.send(JSON.stringify({ tv: 1, error: e.message })); } catch {} }
 }
 
-// order entry (v1): REST-style via api socket
 app.post("/api/tv/order", async (req, res) => {
   try {
     const { action, contractId, qty } = req.body || {};
+    const s = tvSessions.get("default") || {};
+    await tvAuth("default");
     const WebSocketClient = require("ws").WebSocket;
-    const token = await tvAuth("default");
     const tv = new WebSocketClient(TVCFG.wsApi);
     await new Promise((r, j) => { tv.on("open", r); tv.on("error", j); });
-    const send = o => tv.send(tvEnc(JSON.stringify(o)));
-    let rid = 1;
+    let rid = 1; let accountId = null;
     const done = new Promise((resolve, reject) => {
-      const to = setTimeout(() => reject(new Error("timeout")), 10000);
-      tv.on("message", buf => tvDec(buf).forEach(m => {
-        if (m.s === 200 && m.d && m.d.length) {   // account list
-          const acct = m.d[0].id;
-          send({ id: rid++, method: "order/placeOrder", params: { accountId: acct, contractId, action, orderQty: qty, orderType: "Market", timeInForce: { duration: "Day" }, isAutomated: true } });
-        }
-        if (m.d && m.d.orderId) { clearTimeout(to); resolve(m.d); }
-        if (m.e) { clearTimeout(to); reject(new Error(m.e)); }
+      const to = setTimeout(() => reject(new Error("timeout")), 12000);
+      tv.on("message", raw => tvParseFrames(raw).forEach(m => {
+        if (m._frame === "h") { tv.send("[]"); return; }
+        if (m._frame || !m.s) return;
+        if (m.s === 200 && m.d && Array.isArray(m.d) && m.d[0] && m.d[0].id && !accountId) {
+          accountId = m.d[0].id;
+          tv.send(JSON.stringify(["order/placeOrder", rid++, { accountId, contractId, action, orderQty: qty, orderType: "Market", timeInForce: { duration: "Day" }, isAutomated: true }]));
+        } else if (m.s === 200 && m.d && (m.d.orderId || m.d.a)) { clearTimeout(to); resolve(m.d); }
+        else if (m.e || (m.s && m.s >= 400)) { clearTimeout(to); reject(new Error(m.d || m.e || "order error")); }
       }));
     });
-    send({ id: rid++, method: "authorize", params: { token } });
-    send({ id: rid++, method: "account/list", params: {} });
-    const out = await done;
-    res.json({ ok: true, order: out });
+    tv.send(JSON.stringify(["authorize", rid++, { token: s.token }]));
+    tv.send(JSON.stringify(["account/list", rid++, {}]));
+    res.json({ ok: true, order: await done });
+    tv.close();
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
