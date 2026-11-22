@@ -15,14 +15,14 @@ const baseUrl = () => (process.env.ALPACA_ENV === "live" ? LIVE_URL : PAPER_URL)
 
 const DATA_URL = "https://data.alpaca.markets"; // market data lives here (same keys)
 
-async function alpacaFetch(path, options = {}) {
+async function alpacaFetch(path, options = {}, creds = null) {
   // price/chart data -> data.alpaca.markets, trading -> paper/api.alpaca.markets
   const base = path.startsWith("/v2/stocks") ? DATA_URL : baseUrl();
   const res = await fetch(base + path, {
     ...options,
     headers: {
-      "APCA-API-KEY-ID": process.env.ALPACA_KEY,
-      "APCA-API-SECRET-KEY": process.env.ALPACA_SECRET,
+      "APCA-API-KEY-ID": (creds && creds.key) || process.env.ALPACA_KEY,
+      "APCA-API-SECRET-KEY": (creds && creds.secret) || process.env.ALPACA_SECRET,
       "Content-Type": "application/json",
     },
   });
@@ -315,7 +315,11 @@ app.get("/api/health", (req, res) =>
   res.json({ status: "ok", env: process.env.ALPACA_ENV || "paper", time: new Date().toISOString() }));
 
 app.get("/api/account", async (req, res) => {
-  try { res.json(await cached("acct", 10000, () => alpacaFetch("/v2/account"))); }
+  try {
+    const uc = userCreds(req);
+    const f = () => alpacaFetch("/v2/account", {}, uc);
+    res.json(uc ? await f() : await cached("acct", 10000, f));
+  }
   catch (e) { res.status(e.status || 500).json({ error: e.message, details: e.details }); }
 });
 
@@ -399,22 +403,26 @@ app.post("/api/orders", async (req, res) => {
     res.status(201).json(await alpacaFetch("/v2/orders", {
       method: "POST",
       body: JSON.stringify({ symbol: symbol.toUpperCase(), qty, side, type: "market", time_in_force: "day" }),
-    }));
+    }, userCreds(req)));
   } catch (e) { res.status(e.status || 500).json({ error: e.message, details: e.details }); }
 });
 
 app.get("/api/positions", async (req, res) => {
-  try { res.json(await cached("pos", 10000, () => alpacaFetch("/v2/positions"))); }
+  try {
+    const uc = userCreds(req);
+    const f = () => alpacaFetch("/v2/positions", {}, uc);
+    res.json(uc ? await f() : await cached("pos", 10000, f));
+  }
   catch (e) { res.status(e.status || 500).json({ error: e.message, details: e.details }); }
 });
 
 app.get("/api/orders", async (req, res) => {
-  try { res.json(await alpacaFetch("/v2/orders?status=all&limit=50")); }
+  try { res.json(await alpacaFetch("/v2/orders?status=all&limit=50", {}, userCreds(req))); }
   catch (e) { res.status(e.status || 500).json({ error: e.message, details: e.details }); }
 });
 
 app.post("/api/orders/cancel-all", async (req, res) => {
-  try { res.json(await alpacaFetch("/v2/orders", { method: "DELETE" })); }
+  try { res.json(await alpacaFetch("/v2/orders", { method: "DELETE" }, userCreds(req))); }
   catch (e) { res.status(e.status || 500).json({ error: e.message, details: e.details }); }
 });
 
