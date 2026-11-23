@@ -310,6 +310,21 @@ app.post("/api/promo/toggle", (req, res) => {
   res.json({ ok: true });
 });
 
+// ===== ADMIN: manage Pro access for paying customers =====
+app.get("/api/admin/users", (req, res) => {
+  if (!adminOk(req)) return res.status(403).json({ error: "Admin key required" });
+  res.json(users.map(u => ({ username: u.username, pro: !!u.pro, created: u.created })).sort((a, b) => a.username.localeCompare(b.username)));
+});
+app.post("/api/admin/grant-pro", (req, res) => {
+  if (!adminOk(req)) return res.status(403).json({ error: "Admin key required" });
+  const { username, pro } = req.body || {};
+  const u = users.find(x => x.username.toLowerCase() === String(username || "").toLowerCase());
+  if (!u) return res.status(404).json({ error: "User not found — they must sign up first" });
+  u.pro = pro !== false;
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+  res.json({ ok: true, username: u.username, pro: u.pro });
+});
+
 // ============ TRADING ROUTES ============
 app.get("/api/health", (req, res) =>
   res.json({ status: "ok", env: process.env.ALPACA_ENV || "paper", time: new Date().toISOString() }));
@@ -374,7 +389,7 @@ app.get("/api/bars/:symbol", async (req, res) => {
   try {
     const symbol = req.params.symbol.toUpperCase();
     const timeframe = req.query.timeframe || "15Min";
-    let candles = await cached(`b:${symbol}:${timeframe}`, 60000, async () => {
+    let candles = await cached(`b:${symbol}:${timeframe}`, 30000, async () => {
       // Try Alpaca first
       try {
         const data = await alpacaFetch(`/v2/stocks/${symbol}/bars?timeframe=${timeframe}&limit=300&feed=iex`);
@@ -492,7 +507,17 @@ const SBOT_STRATS = {
     if(r[r.length-1].v<45&&last.close<e[e.length-1].v)return{side:"sell",reason:"downside momentum"};return null;},
 };
 
+const fcCache = new Map();
 async function fetchCandles(symbol, tf) {
+  const key = symbol + ":" + tf;
+  const hit = fcCache.get(key);
+  if (hit && Date.now() - hit.t < 30000) return hit.d;
+  const d = await fetchCandlesRaw(symbol, tf);
+  fcCache.set(key, { t: Date.now(), d });
+  if (fcCache.size > 400) { const k0 = fcCache.keys().next().value; fcCache.delete(k0); }
+  return d;
+}
+async function fetchCandlesRaw(symbol, tf) {
   try {
     const d = await alpacaFetch(`/v2/stocks/${symbol}/bars?timeframe=${tf}&limit=120&feed=iex`);
     let bars = d.bars; if (!Array.isArray(bars)) bars = (bars && bars[symbol]) || [];
