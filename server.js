@@ -116,7 +116,12 @@ setInterval(async () => {
 const crypto = require("crypto");
 const USERS_FILE = "./users.json";
 let users = fs.existsSync(USERS_FILE) ? JSON.parse(fs.readFileSync(USERS_FILE, "utf8")) : [];
-const sessions = new Map(); // token -> username
+// sessions persisted to disk so logins survive server restarts/redeploys
+const SESSIONS_FILE = "./sessions.json";
+const sessions = new Map(
+  fs.existsSync(SESSIONS_FILE) ? JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf8")) : []
+);
+function saveSessions(){ fs.writeFileSync(SESSIONS_FILE, JSON.stringify([...sessions])); }
 function hashPw(pw, salt) { return crypto.scryptSync(String(pw), salt, 32).toString("hex"); }
 
 app.post("/api/signup", (req, res) => {
@@ -139,6 +144,7 @@ app.post("/api/login", (req, res) => {
     return res.status(401).json({ error: "Wrong username or password" });
   const token = crypto.randomBytes(24).toString("hex");
   sessions.set(token, u.username);
+  saveSessions();
   res.json({ token, username: u.username, pro: ADMIN_USERS.includes(u.username.toLowerCase()) || !!u.pro });
 });
 
