@@ -385,6 +385,7 @@ async function yahooBars(symbol, timeframe) {
   return out;
 }
 
+const barsLastGood = new Map(); // serve last-good data when upstream rate-limits hit
 app.get("/api/bars/:symbol", async (req, res) => {
   try {
     const symbol = req.params.symbol.toUpperCase();
@@ -404,8 +405,11 @@ app.get("/api/bars/:symbol", async (req, res) => {
       console.log("Alpaca bars empty/unavailable - using Yahoo for", symbol);
       return yahooBars(symbol, timeframe);
     });
+    if (Array.isArray(candles) && candles.length) barsLastGood.set(symbol + ":" + timeframe, candles);
     res.json(candles);
   } catch (e) {
+    const stale = barsLastGood.get(req.params.symbol.toUpperCase() + ":" + (req.query.timeframe || "15Min"));
+    if (stale && stale.length) return res.json(stale); // upstream rate-limited: serve last-good
     res.status(e.status || 500).json({ error: e.message, details: e.details });
   }
 });
