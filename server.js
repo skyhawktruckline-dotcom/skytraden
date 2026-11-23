@@ -335,6 +335,11 @@ app.post("/api/admin/grant-pro", (req, res) => {
 app.get("/api/health", (req, res) =>
   res.json({ status: "ok", env: process.env.ALPACA_ENV || "paper", time: new Date().toISOString() }));
 
+function userCreds(req) {
+  const k = req.headers["x-alpaca-key"], s = req.headers["x-alpaca-secret"];
+  return (k && s) ? { key: k, secret: s } : null;
+}
+
 app.get("/api/account", async (req, res) => {
   try {
     const uc = userCreds(req);
